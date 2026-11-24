@@ -181,7 +181,7 @@ jobs:
             exit 1
           fi
 
-          APP_VERSION="$(node -p 'const m = require("./apps/mobile/package.json").version; m && m !== "0.0.0" ? m : require("./package.json").version')"
+          APP_VERSION="$(node -p '[require("./apps/mobile/package.json").version, require("./apps/server/package.json").version].find((v) => v && v !== "0.0.0") || "0.0.0"')"
           SHORT_SHA="${GITHUB_SHA::7}"
           IPA_NAME="T3Code-${APP_VERSION}-ios17-unsigned-${SHORT_SHA}.ipa"
 
