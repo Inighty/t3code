@@ -1,0 +1,271 @@
+name: Build Unsigned iOS IPA
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish GitHub Release for this unsigned IPA"
+        type: boolean
+        default: true
+
+concurrency:
+  group: ios-unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  verify_ios17:
+    name: Verify iOS 17.0 compatibility
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Drop checkout credentials
+        uses: ./.github/actions/drop-checkout-credentials
+
+      - name: Check iOS 17.0 compatibility & sync tests
+        run: |
+          node scripts/ios17-compat.mjs --check
+          node --test scripts/ios17-compat.test.mjs .github/scripts/sync-upstream-ios17.test.mjs
+
+  build_ipa:
+    name: Build unsigned Release IPA (iOS 17.0)
+    needs: [verify_ios17]
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: xcode-27
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      ipa_name: ${{ steps.package.outputs.ipa_name }}
+      app_version: ${{ steps.package.outputs.app_version }}
+      short_sha: ${{ steps.package.outputs.short_sha }}
+      min_os_version: ${{ steps.package.outputs.min_os_version }}
+    env:
+      APP_VARIANT: production
+      T3CODE_MOBILE_UPDATES_ENABLED: "0"
+      EXPO_NO_GIT_STATUS: "1"
+      CI: "1"
+      NODE_OPTIONS: "--max-old-space-size=8192"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Drop checkout credentials
+        uses: ./.github/actions/drop-checkout-credentials
+
+      - name: Select Xcode 27
+        run: |
+          xcode=""
+          if [ -d "/Applications/Xcode_27.1.app" ]; then
+            xcode="/Applications/Xcode_27.1.app"
+          else
+            xcode="$(ls -d /Applications/Xcode_27*.app /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          fi
+          if [ -z "$xcode" ] || [ ! -d "$xcode" ]; then
+            ls -la /Applications || true
+            echo "::error::Xcode 27 not found on this runner."
+            exit 1
+          fi
+          sudo xcode-select -s "$xcode/Contents/Developer"
+          xcodebuild -version
+          echo "- Xcode: \`$(basename "$xcode")\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: package.json
+
+      - name: Enable corepack
+        run: |
+          npm install --global corepack@latest
+          corepack enable
+          pnpm --version
+
+      - id: pnpm_store
+        name: Resolve pnpm store path
+        run: echo "dir=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pnpm_store.outputs.dir }}
+          key: ${{ runner.os }}-pnpm-mobile-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-mobile-
+
+      - name: Install mobile dependencies
+        run: pnpm install --frozen-lockfile --filter=@t3tools/mobile...
+
+      - name: Setup CocoaPods
+        run: |
+          command -v pod || sudo gem install cocoapods --no-document
+          pod --version
+
+      - name: Cache CocoaPods
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: ${{ runner.os }}-cocoapods-${{ hashFiles('pnpm-lock.yaml', 'apps/mobile/package.json', 'apps/mobile/app.config.ts') }}
+          restore-keys: |
+            ${{ runner.os }}-cocoapods-
+
+      - name: Expo prebuild (iOS)
+        working-directory: apps/mobile
+        run: npx expo prebuild --clean --platform ios --no-install
+
+      - name: Verify prebuild iOS 17.0 configuration
+        run: node scripts/ios17-compat.mjs --check --check-prebuild
+
+      - name: Install CocoaPods dependencies
+        working-directory: apps/mobile/ios
+        env:
+          LANG: en_US.UTF-8
+        run: pod install --repo-update || pod install
+
+      - name: Build unsigned Release app
+        working-directory: apps/mobile/ios
+        run: |
+          export NODE_BINARY="$(command -v node)"
+          DERIVED_DATA="$(cd "$RUNNER_TEMP" && pwd -P)/derived-data"
+          xcodebuild \
+            -workspace T3Code.xcworkspace \
+            -scheme T3Code \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_STYLE=Manual \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build
+
+      - id: package
+        name: Package & verify unsigned IPA
+        run: |
+          DERIVED_DATA="$(cd "$RUNNER_TEMP" && pwd -P)/derived-data"
+          APP_PATH="$DERIVED_DATA/Build/Products/Release-iphoneos/T3Code.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::Expected T3Code.app at $APP_PATH"
+            find "$DERIVED_DATA/Build/Products" -maxdepth 3 || true
+            exit 1
+          fi
+
+          MIN_OS="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP_PATH/Info.plist")"
+          echo "Built app MinimumOSVersion: $MIN_OS"
+          if [ "$MIN_OS" != "17.0" ]; then
+            echo "::error::Expected MinimumOSVersion 17.0, got $MIN_OS"
+            exit 1
+          fi
+
+          if [ -z "$(find "$APP_PATH" -maxdepth 2 -name "*.jsbundle" -print -quit)" ]; then
+            echo "::error::Missing embedded Release JS bundle (*.jsbundle) in T3Code.app"
+            ls -la "$APP_PATH"
+            exit 1
+          fi
+
+          APP_VERSION="$(node -p 'const m = require("./apps/mobile/package.json").version; m && m !== "0.0.0" ? m : require("./package.json").version')"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IPA_NAME="T3Code-${APP_VERSION}-ios17-unsigned-${SHORT_SHA}.ipa"
+
+          STAGE_DIR="$(cd "$RUNNER_TEMP" && pwd -P)/ipa-stage"
+          IPA_DIR="$(cd "$RUNNER_TEMP" && pwd -P)/ipa-out"
+          rm -rf "$STAGE_DIR" "$IPA_DIR"
+          mkdir -p "$STAGE_DIR/Payload" "$IPA_DIR"
+          cp -R "$APP_PATH" "$STAGE_DIR/Payload/"
+          rm -f "$STAGE_DIR/Payload/T3Code.app/embedded.mobileprovision"
+          find "$STAGE_DIR/Payload" -name "_CodeSignature" -type d -exec rm -rf {} +
+
+          IPA_PATH="$IPA_DIR/$IPA_NAME"
+          (cd "$STAGE_DIR" && zip -r -y -q "$IPA_PATH" Payload)
+          (cd "$IPA_DIR" && shasum -a 256 "$IPA_NAME" > "${IPA_NAME}.sha256")
+          ls -lh "$IPA_PATH" "${IPA_PATH}.sha256"
+
+          echo "ipa_name=$IPA_NAME" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "min_os_version=$MIN_OS" >> "$GITHUB_OUTPUT"
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-unsigned-ipa
+          path: |
+            ${{ runner.temp }}/ipa-out/*.ipa
+            ${{ runner.temp }}/ipa-out/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish_release:
+    name: Publish GitHub Release
+    needs: [build_ipa]
+    if: >-
+      !cancelled() &&
+      github.repository != 'pingdotgg/t3code' &&
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_dispatch' || inputs.publish_release != false)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IPA_NAME: ${{ needs.build_ipa.outputs.ipa_name }}
+      APP_VERSION: ${{ needs.build_ipa.outputs.app_version }}
+      SHORT_SHA: ${{ needs.build_ipa.outputs.short_sha }}
+      MIN_OS_VERSION: ${{ needs.build_ipa.outputs.min_os_version }}
+    steps:
+      - name: Download unsigned IPA artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ios-unsigned-ipa
+          path: ipa-artifacts
+
+      - name: Create or update GitHub Release
+        run: |
+          ipa_path="ipa-artifacts/${IPA_NAME}"
+          sha_path="ipa-artifacts/${IPA_NAME}.sha256"
+          if [ ! -f "$ipa_path" ]; then
+            echo "::error::Missing $ipa_path"
+            ls -la ipa-artifacts
+            exit 1
+          fi
+
+          sha256="$(cut -d' ' -f1 "$sha_path")"
+          tag="ios-unsigned-${APP_VERSION}-${SHORT_SHA}"
+          title="T3 Code ${APP_VERSION} (iOS ${MIN_OS_VERSION}+ Unsigned IPA, ${SHORT_SHA})"
+          notes="$(cat <<EOF
+          Unsigned Release iOS build built from commit \`${GITHUB_SHA}\`.
+
+          - **Minimum iOS version**: \`${MIN_OS_VERSION}\` (verified in \`Info.plist\`)
+          - **Signing**: Unsigned (\`CODE_SIGNING_ALLOWED=NO\`) for sideloading (TrollStore / AltStore / SideStore / Sideloadly / Feather)
+          - **SHA-256**: \`${sha256}\`
+          EOF
+          )"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$ipa_path" "$sha_path" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "$ipa_path" "$sha_path" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes "$notes"
+          fi

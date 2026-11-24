@@ -1,0 +1,144 @@
+name: Sync Upstream (iOS 17)
+
+on:
+  schedule:
+    # Run every 6 hours at minute 23 (avoiding busy :00 slots).
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      trigger_ipa:
+        description: "Trigger unsigned iOS Release IPA build when upstream changes are merged"
+        type: boolean
+        default: true
+
+concurrency:
+  group: fork-upstream-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  sync:
+    name: Sync upstream & preserve iOS 17.0
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+    env:
+      HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: package.json
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - id: sync
+        name: Merge upstream and preserve iOS 17.0
+        run: |
+          node .github/scripts/sync-upstream-ios17.mjs \
+            --upstream-url "https://github.com/pingdotgg/t3code.git" \
+            --upstream-branch main
+
+      - name: Verify iOS 17.0 compatibility
+        run: node scripts/ios17-compat.mjs --check
+
+      - name: Check workflow push permission when SYNC_TOKEN is unset
+        if: steps.sync.outputs.updated == 'true' && steps.sync.outputs.workflows_changed == 'true' && env.HAS_SYNC_TOKEN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+        run: |
+          cat <<'MSG' >> "$GITHUB_STEP_SUMMARY"
+          ### Upstream sync paused: `SYNC_TOKEN` required
+
+          Upstream modified `.github/workflows/`, which GitHub refuses to push using the default `GITHUB_TOKEN`.
+          Add a repository secret named `SYNC_TOKEN` (PAT with `repo` + `workflow` scope, or fine-grained PAT with **Contents: Read and write** and **Workflows: Read and write**) and re-run **Sync Upstream (iOS 17)**.
+          MSG
+          title="Upstream sync paused: SYNC_TOKEN secret needed for workflow updates"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
+          body="Upstream commit \`${UPSTREAM_SHA}\` modified \`.github/workflows/\`. GitHub Actions cannot push workflow file changes using the default \`GITHUB_TOKEN\`.
+
+          To let automatic sync merge workflow updates:
+          1. Create a Personal Access Token with \`repo\` and \`workflow\` permissions (or fine-grained token with **Contents** and **Workflows** write access on \`${GITHUB_REPOSITORY}\`).
+          2. Add it as repository secret \`SYNC_TOKEN\` in **Settings -> Secrets and variables -> Actions**.
+          3. Manually run the **Sync Upstream (iOS 17)** workflow (or wait for the next schedule)."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+          exit 1
+
+      - name: Report merge conflict
+        if: failure() && steps.sync.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONFLICT_FILES: ${{ steps.sync.outputs.conflict_files }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Upstream sync conflict needs manual resolution"
+          body="Merging \`pingdotgg/t3code\` (\`${UPSTREAM_SHA}\`) conflicted outside auto-managed iOS 17 lines:
+
+          - Conflicting paths: \`${CONFLICT_FILES}\`
+          - Workflow run: ${RUN_URL}
+
+          Please merge \`pingdotgg/t3code\` \`main\` locally while preserving \`scripts/ios17-compat.mjs --check\`."
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+
+      - name: Push synced main branch
+        if: steps.sync.outputs.updated == 'true'
+        run: git push origin HEAD:main
+
+      - name: Dispatch unsigned iOS IPA build
+        if: steps.sync.outputs.updated == 'true' && env.HAS_SYNC_TOKEN != 'true' && inputs.trigger_ipa != false
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ios-unsigned-ipa.yml --repo "$GITHUB_REPOSITORY" --ref main
+
+      - name: Disable unrelated upstream workflows on fork
+        if: '!cancelled()'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active" and .path != ".github/workflows/fork-upstream-sync.yml" and .path != ".github/workflows/ios-unsigned-ipa.yml") | .id' \
+            | while read -r wf_id; do
+                [ -n "$wf_id" ] || continue
+                gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf_id}/disable" >/dev/null || true
+              done
+
+      - name: Summary
+        if: always()
+        env:
+          UPDATED: ${{ steps.sync.outputs.updated }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          HEAD_SHA: ${{ steps.sync.outputs.head_sha }}
+        run: |
+          {
+            echo "- Upstream SHA: \`${UPSTREAM_SHA:-unknown}\`"
+            echo "- Updated: \`${UPDATED:-false}\`"
+            if [ "${UPDATED:-false}" = "true" ]; then
+              echo "- Fork HEAD: \`${HEAD_SHA:-unknown}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
